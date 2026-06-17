@@ -7,10 +7,14 @@ const jobQueue = new Queue("jobs", {
   },
 });
 
-async function addJob() {
-  await jobQueue.add("email", {
-    email: "test@gmail.com",
-  });
+async function addJob(type: string, data: object): Promise<Queue | any> {
+  try {
+    const newJob = await jobQueue.add(type, data);
+    console.log("New Job added in Queue:", newJob.id);
+    return newJob;
+  } catch (error) {
+    console.error("Error while Adding Job:", error);
+  }
 }
 
-export {jobQueue, addJob};
+export { jobQueue, addJob };

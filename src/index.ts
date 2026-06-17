@@ -3,7 +3,7 @@ import cors from "cors";
 import morgan from "morgan";
 import helmet from "helmet";
 import config from "./config/config.js";
-
+import jobRoutes from './routes/jobs.routes.js'
 const app = express();
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
@@ -14,5 +14,7 @@ app.use(morgan("dev"));
 app.get("/health", async (req, res) => {
   return res.status(200).json({ message: "Health Route!" });
 });
+
+app.use("/api", jobRoutes);
 
 export default app;

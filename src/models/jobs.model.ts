@@ -18,7 +18,6 @@ const JobSchema = new Schema(
       type: Schema.Types.Mixed,
       required: true,
     },
-
     bullJobId: {
       type: String,
     },
