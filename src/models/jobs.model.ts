@@ -7,30 +7,26 @@ const JobSchema = new Schema(
       enum: ["email", "pdf", "image"],
       required: true,
     },
-
     status: {
       type: String,
       enum: ["queued", "processing", "completed", "failed", "cancelled"],
       default: "queued",
     },
-
     payload: {
       type: Schema.Types.Mixed,
       required: true,
     },
     bullJobId: {
       type: String,
+      index: true
     },
-
     retryCount: {
       type: Number,
       default: 0,
     },
-
     completedAt: {
       type: Date,
     },
-
     error: {
       type: String,
     },

@@ -9,11 +9,18 @@ const jobQueue = new Queue("jobs", {
 
 async function addJob(type: string, data: object): Promise<Queue | any> {
   try {
-    const newJob = await jobQueue.add(type, data);
-    console.log("New Job added in Queue:", newJob.id);
+    const newJob = await jobQueue.add(type, data, {
+      attempts: 3,
+      backoff: {
+        type: "exponential",
+        delay: 2000,
+      },
+    });
+
     return newJob;
   } catch (error) {
     console.error("Error while Adding Job:", error);
+    return null;
   }
 }
 
