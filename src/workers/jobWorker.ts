@@ -1,7 +1,8 @@
 import { Worker, Job } from "bullmq";
 import jobsModel from "../models/jobs.model.js";
 import deadLetterQueue from "../queues/deadLetterQueue.js";
-import { processEmail } from "../utils/processEmail.js";
+import { processEmail } from "./processEmail.js";
+import { processPdf } from "./processPdf.js";
 
 let jobWorker: Worker;
 
@@ -70,6 +71,10 @@ const handleJobWorker = async (job: Job) => {
   switch (job.name) {
     case "email":
       await processEmail(job.data.payload);
+      break;
+
+    case "pdf":
+      await processPdf({ jobId: job.id, content: job.data.payload.content });
       break;
 
     default:

@@ -8,7 +8,7 @@ import z from "zod";
 const getAllJobs = asyncHandler(async (req: Request, res: Response) => {
   const allJobs = await jobsModel
     .find()
-    .select("type payload status retryCount error bullJobId");
+    .select("type payload status pdfPath retryCount error");
 
   return res.status(200).json({ success: true, allJobs });
 });

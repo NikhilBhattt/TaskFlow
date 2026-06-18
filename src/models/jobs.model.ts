@@ -16,9 +16,12 @@ const JobSchema = new Schema(
       type: Schema.Types.Mixed,
       required: true,
     },
+    pdfPath: {
+      type: String,
+    },
     bullJobId: {
       type: String,
-      index: true
+      index: true,
     },
     retryCount: {
       type: Number,
