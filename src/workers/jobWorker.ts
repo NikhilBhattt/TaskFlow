@@ -1,7 +1,7 @@
-import { delay, Worker, Job } from "bullmq";
+import { Worker, Job } from "bullmq";
 import jobsModel from "../models/jobs.model.js";
-import processEmail from "../utils/processEmail.js";
 import deadLetterQueue from "../queues/deadLetterQueue.js";
+import { processEmail } from "../utils/processEmail.js";
 
 let jobWorker: Worker;
 
@@ -67,10 +67,13 @@ const handleJobWorker = async (job: Job) => {
     );
   }
 
-  await delay(5000);
+  switch (job.name) {
+    case "email":
+      await processEmail(job.data.payload);
+      break;
 
-  if (false) {
-    throw new Error("Random failure");
+    default:
+      throw new Error("Unknown job type");
   }
 };
 
