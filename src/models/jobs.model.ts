@@ -16,7 +16,10 @@ const JobSchema = new Schema(
       type: Schema.Types.Mixed,
       required: true,
     },
-    pdfPath: {
+    pdfUrl: {
+      type: String,
+    },
+    pdfPublicId: {
       type: String,
     },
     bullJobId: {

@@ -1,13 +1,21 @@
 import PDFDocument from "pdfkit";
 import fs from "fs";
 import path from "path";
+import { uploadPDFtoCloudinary } from "./cloudinary.service.js";
 
 interface JobReport {
   jobId: string;
   content: string;
 }
 
-export const generatePdfReport = async (data: JobReport): Promise<string> => {
+interface UploadResult {
+  url: string;
+  publicId: string;
+}
+
+export const generatePdfReport = async (
+  data: JobReport,
+): Promise<UploadResult> => {
   return new Promise((resolve, reject) => {
     const reportsDir = path.join(process.cwd(), "reports");
 
@@ -42,8 +50,15 @@ export const generatePdfReport = async (data: JobReport): Promise<string> => {
 
     doc.end();
 
-    stream.on("finish", () => {
-      resolve(filePath);
+    stream.on("finish", async () => {
+      try {
+        const uploadResult: UploadResult =
+          await uploadPDFtoCloudinary(filePath);
+        fs.unlinkSync(filePath);
+        resolve(uploadResult);
+      } catch (error) {
+        reject(error);
+      }
     });
 
     stream.on("error", reject);

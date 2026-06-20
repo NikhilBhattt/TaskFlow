@@ -3,14 +3,15 @@ import jobsModel from "../models/jobs.model.js";
 import deadLetterQueue from "../queues/deadLetterQueue.js";
 import { processEmail } from "./processEmail.js";
 import { processPdf } from "./processPdf.js";
+import config from "../config/config.js";
 
 let jobWorker: Worker;
 
 const initializeJobWorker = () => {
   jobWorker = new Worker("jobs", async (job) => await handleJobWorker(job), {
     connection: {
-      host: "localhost",
-      port: 6379,
+      host: config.REDIS_HOST,
+      port: Number(config.REDIS_PORT),
     },
   });
 

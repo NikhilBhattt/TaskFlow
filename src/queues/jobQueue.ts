@@ -1,9 +1,10 @@
 import { Queue } from "bullmq";
+import config from "../config/config.js";
 
 const jobQueue = new Queue("jobs", {
   connection: {
-    host: "localhost",
-    port: 6379,
+    host: config.REDIS_HOST,
+    port: Number(config.REDIS_PORT),
   },
 });
 
