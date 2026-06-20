@@ -13,6 +13,7 @@ const initializeJobWorker = () => {
       host: config.REDIS_HOST,
       port: Number(config.REDIS_PORT),
     },
+    concurrency: 5,
   });
 
   jobWorker.on("completed", async (job) => {
