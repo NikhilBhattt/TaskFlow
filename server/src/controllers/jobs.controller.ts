@@ -2,8 +2,8 @@ import jobsModel from "../models/jobs.model.js";
 import deadLetterQueue from "../queues/deadLetterQueue.js";
 import { jobQueue, addJob } from "../queues/jobQueue.js";
 import asyncHandler from "../utils/asyncHandler.js";
+import { validateJobInput } from "../utils/jobValidation.js";
 import type { Request, Response } from "express";
-import z from "zod";
 
 const getAllJobs = asyncHandler(async (req: Request, res: Response) => {
   const allJobs = await jobsModel
@@ -22,7 +22,7 @@ const getJob = asyncHandler(async (req: Request, res: Response) => {
       .json({ success: false, message: "Job Id is required!" });
   }
 
-  const job = await jobsModel.findById(id).select("status error");
+  const job = await jobsModel.findById(id).select("type status error");
 
   if (!job) {
     return res.status(404).json({ success: false, message: "Job not found!" });
@@ -34,26 +34,30 @@ const getJob = asyncHandler(async (req: Request, res: Response) => {
 const createJob = asyncHandler(async (req: Request, res: Response) => {
   const { type, payload } = req.body;
 
-  if (!type || !payload) {
+  if (!type || payload === undefined) {
     return res
       .status(400)
       .json({ success: false, message: "Missing Type and Payload data!" });
   }
 
-  const JobSchema = z.enum(["email", "pdf", "image"]);
+  const validation = validateJobInput(type, payload);
 
-  const validate = JobSchema.safeParse(type);
-
-  if (!validate) {
-    res.status(400).json({ success: false, message: "Invalid Job Type" });
+  if (!validation.ok) {
+    return res.status(400).json({
+      success: false,
+      message: validation.message,
+    });
   }
 
   const mongoJob = await jobsModel.create({
-    type,
-    payload,
+    type: validation.type,
+    payload: validation.payload,
   });
 
-  const newBullJob = await addJob(type, { payload, mongoJobId: mongoJob._id });
+  const newBullJob = await addJob(validation.type, {
+    payload: validation.payload,
+    mongoJobId: mongoJob._id,
+  });
 
   if (!newBullJob) {
     return res

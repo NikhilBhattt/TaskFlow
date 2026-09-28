@@ -6,6 +6,7 @@
   "type": "module",
   "scripts": {
     "dev": "tsx watch src/server.ts",
+    "dev:frontend": "npm --prefix frontend run dev -- --host 0.0.0.0",
     "build": "tsc",
     "start": "node dist/server.js"
   },

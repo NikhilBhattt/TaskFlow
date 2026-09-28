@@ -17,6 +17,18 @@ export const generatePdfReport = async (
   data: JobReport,
 ): Promise<UploadResult> => {
   return new Promise((resolve, reject) => {
+    if (!data?.jobId) {
+      reject(new Error("PDF generation requires a valid jobId."));
+      return;
+    }
+
+    const content = typeof data.content === "string" ? data.content : JSON.stringify(data.content ?? "");
+
+    if (!content.trim()) {
+      reject(new Error("PDF generation requires non-empty content."));
+      return;
+    }
+
     const reportsDir = path.join(process.cwd(), "reports");
 
     if (!fs.existsSync(reportsDir)) {
@@ -42,7 +54,7 @@ export const generatePdfReport = async (
     doc.fontSize(14);
 
     doc.text(`Job ID: ${data.jobId}`);
-    doc.text(`Job content: ${data.content}`);
+    doc.text(`Job content: ${content}`);
 
     doc.moveDown();
 

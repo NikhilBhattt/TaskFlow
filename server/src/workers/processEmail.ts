@@ -8,5 +8,4 @@ const processEmail = async (payload: {
   await sendEmail(payload.to, payload.subject, payload.message);
 };
 
-
-export {processEmail}
+export { processEmail };

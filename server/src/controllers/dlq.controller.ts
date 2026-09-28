@@ -5,7 +5,7 @@ import asyncHandler from "../utils/asyncHandler.js";
 import type { Request, Response } from "express";
 
 const getAllFailedJobs = asyncHandler(async (req: Request, res: Response) => {
-  const result = await deadLetterQueue.getJobs(["waiting", "completed"]);
+  const result = await deadLetterQueue.getJobs(["waiting", "completed", "delayed"]);
 
   const jobs = result.map((job) => {
     return {
@@ -19,18 +19,28 @@ const getAllFailedJobs = asyncHandler(async (req: Request, res: Response) => {
 });
 
 const retryFailedJob = asyncHandler(async (req: Request, res: Response) => {
-  const id = req.params.id;
+  const rawId = req.params.id;
+  const id = Array.isArray(rawId) ? rawId[0]?.trim() : rawId?.trim();
+
+  if (!id) {
+    return res.status(400).json({ success: false, message: "Job Id is required!" });
+  }
 
   const failedJob = await deadLetterQueue.getJob(id as string);
 
   if (!failedJob) {
-    return res.status(400).json({ success: true, message: "Invalid Job Id!" });
+    return res.status(404).json({ success: false, message: "Failed job not found!" });
   }
 
-  const newJob = await addJob(failedJob.data.originalType, {
+  const originalType = failedJob.data.originalType ?? "email";
+  const newJob = await addJob(originalType, {
     payload: failedJob.data.payload,
     mongoJobId: failedJob.data.mongoJobId,
   });
+
+  if (!newJob) {
+    return res.status(400).json({ success: false, message: "Unable to retry this job." });
+  }
 
   await jobsModel.updateOne(
     {
@@ -38,7 +48,7 @@ const retryFailedJob = asyncHandler(async (req: Request, res: Response) => {
     },
     {
       bullJobId: newJob.id,
-      status: "processing",
+      status: "queued",
       error: null,
     },
   );

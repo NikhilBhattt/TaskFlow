@@ -33,6 +33,7 @@ const initializeJobWorker = () => {
     if (!job) return;
 
     const isFinalFailure = job.attemptsMade >= (job.opts.attempts ?? 1);
+    const errorMessage = err instanceof Error ? err.message : String(err);
 
     await jobsModel.updateOne(
       { _id: job.data.mongoJobId },
@@ -40,7 +41,7 @@ const initializeJobWorker = () => {
         retryCount: job.attemptsMade,
         ...(isFinalFailure && {
           status: "failed",
-          error: err.message,
+          error: errorMessage,
         }),
       },
     );
@@ -51,7 +52,7 @@ const initializeJobWorker = () => {
         originalType: job.name,
         payload: job.data.payload,
         mongoJobId: job.data.mongoJobId,
-        error: err.message,
+        error: errorMessage,
         failedAt: new Date(),
       });
 
@@ -76,11 +77,11 @@ const handleJobWorker = async (job: Job) => {
       break;
 
     case "pdf":
-      await processPdf({ jobId: job.id, content: job.data.payload.content });
+      await processPdf({ jobId: String(job.id), content: job.data.payload.content });
       break;
 
     default:
-      throw new Error("Unknown job type");
+      throw new Error(`Unknown job type: ${job.name}`);
   }
 };
 

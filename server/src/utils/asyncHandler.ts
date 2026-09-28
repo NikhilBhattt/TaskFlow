@@ -5,10 +5,15 @@ const asyncHandler = (fn: Function) => {
     try {
       await fn(req, res, next);
     } catch (error: Error | any) {
-      console.log("Error from AsyncHandler");
-      res.status(500).json({
+      console.error("Error from AsyncHandler:", error);
+
+      if (res.headersSent) {
+        return next(error);
+      }
+
+      return res.status(500).json({
         success: false,
-        message: error.message,
+        message: error?.message || "Internal server error",
       });
     }
   };
