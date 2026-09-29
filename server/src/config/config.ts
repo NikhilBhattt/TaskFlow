@@ -2,7 +2,7 @@ import { configDotenv } from "dotenv";
 configDotenv();
 
 const config = {
-  PORT: process.env.PORT || 5000,
+  PORT: process.env.PORT || 8000,
 
   CORS_ORIGIN: process.env.CORS_ORIGIN || "*",
 
@@ -14,10 +14,9 @@ const config = {
   EMAIL_USER: process.env.EMAIL_USER || undefined,
   EMAIL_PASSWORD: process.env.EMAIL_PASSWORD || undefined,
 
-  CLOUDINARY_URL: process.env.CLOUDINARY_URL || undefined,
   CLOUDINARY_CLOUD_NAME: process.env.CLOUDINARY_CLOUD_NAME || undefined,
   CLOUDINARY_API_KEY: process.env.CLOUDINARY_API_KEY || undefined,
-  CLOUDINARY_API_SECRET: process.env.CLOUDINARY_API_SECRET || undefined
+  CLOUDINARY_API_SECRET: process.env.CLOUDINARY_API_SECRET || undefined,
 };
 
 export default config;

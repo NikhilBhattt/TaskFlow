@@ -1,16 +1,22 @@
 {
   "name": "taskflow",
   "version": "1.0.0",
-  "description": "",
-  "main": "src/server.js",
+  "description": "TaskFlow backend: Express API, BullMQ queues, and background job worker",
+  "main": "dist/server.js",
   "type": "module",
   "scripts": {
     "dev": "tsx watch src/server.ts",
-    "dev:frontend": "npm --prefix frontend run dev -- --host 0.0.0.0",
     "build": "tsc",
-    "start": "node dist/server.js"
+    "start": "node dist/server.js",
+    "test": "tsx --test \"src/__tests__/*.test.ts\""
   },
-  "keywords": [],
+  "keywords": [
+    "bullmq",
+    "redis",
+    "job-queue",
+    "express",
+    "typescript"
+  ],
   "author": "",
   "license": "ISC",
   "dependencies": {
@@ -24,8 +30,7 @@
     "morgan": "^1.11.0",
     "nodemailer": "^9.0.1",
     "pdfkit": "^0.19.1",
-    "redis": "^6.0.0",
-    "zod": "^4.4.3"
+    "taskflow": "file:.."
   },
   "devDependencies": {
     "@types/cors": "^2.8.19",
@@ -34,9 +39,10 @@
     "@types/node": "^25.9.3",
     "@types/nodemailer": "^8.0.1",
     "@types/pdfkit": "^0.17.6",
-    "nodemon": "^3.1.14",
-    "ts-node": "^10.9.2",
     "tsx": "^4.22.4",
     "typescript": "^6.0.3"
+  },
+  "engines": {
+    "node": ">=22"
   }
 }

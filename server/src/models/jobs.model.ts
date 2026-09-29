@@ -4,7 +4,7 @@ const JobSchema = new Schema(
   {
     type: {
       type: String,
-      enum: ["email", "pdf", "image"],
+      enum: ["email", "pdf"],
       required: true,
     },
     status: {

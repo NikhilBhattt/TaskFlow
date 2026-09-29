@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 
 type JobType = "email" | "pdf";
 
@@ -15,10 +15,15 @@ type JobRecord = {
 };
 
 type FailedJob = {
+  dlqId?: string;
   originalId?: string;
   mongoJobId?: string;
+  originalType?: string;
   error?: string;
 };
+
+const API_BASE = `${import.meta.env.VITE_API_URL ?? ""}/api`;
+const POLL_INTERVAL_MS = 3000;
 
 const defaultPayloads: Record<JobType, string> = {
   email: JSON.stringify(
@@ -32,7 +37,6 @@ const defaultPayloads: Record<JobType, string> = {
   ),
   pdf: JSON.stringify(
     {
-      title: "Monthly Executive Summary",
       content:
         "Customer activity trends, operational health, and key business milestones.",
     },
@@ -56,22 +60,36 @@ const toneClasses: Record<string, string> = {
   rose: "bg-rose-500",
 };
 
+class ApiUnreachableError extends Error {
+  constructor() {
+    super("Cannot reach the TaskFlow API. Is the server running?");
+  }
+}
+
+const errorText = (err: unknown, fallback: string) =>
+  err instanceof Error ? err.message : fallback;
+
 async function fetchJson<T>(
   path: string,
   options: RequestInit = {},
 ): Promise<T> {
-  const response = await fetch(`/api${path}`, {
-    headers: {
-      "Content-Type": "application/json",
-      ...(options.headers || {}),
-    },
-    ...options,
-  });
+  let response: Response;
+  try {
+    response = await fetch(`${API_BASE}${path}`, {
+      headers: {
+        "Content-Type": "application/json",
+        ...(options.headers || {}),
+      },
+      ...options,
+    });
+  } catch {
+    throw new ApiUnreachableError();
+  }
 
   const data = await response.json().catch(() => ({}));
 
   if (!response.ok) {
-    throw new Error(data?.message || "Request failed");
+    throw new Error(data?.message || `Request failed (HTTP ${response.status})`);
   }
 
   return data as T;
@@ -84,6 +102,9 @@ function App() {
   const [failedJobs, setFailedJobs] = useState<FailedJob[]>([]);
   const [statusMessage, setStatusMessage] = useState("");
   const [errorMessage, setErrorMessage] = useState("");
+  const [connectionError, setConnectionError] = useState("");
+  const [isLoading, setIsLoading] = useState(true);
+  const [isSubmitting, setIsSubmitting] = useState(false);
   const [selectedJobId, setSelectedJobId] = useState("");
   const [selectedJob, setSelectedJob] = useState<JobRecord | null>(null);
 
@@ -97,36 +118,45 @@ function App() {
     return { total: jobs.length, active, completed, failed };
   }, [jobs]);
 
-  const loadJobs = async () => {
+  // Loads jobs + dead-letter queue together. Used for polling and after every action.
+  const refreshAll = useCallback(async () => {
     try {
-      const data = await fetchJson<{ success: boolean; allJobs?: JobRecord[] }>(
-        "/jobs",
-      );
-      setJobs(data?.allJobs ?? []);
-    } catch (err) {
-      setErrorMessage(
-        err instanceof Error ? err.message : "Unable to load jobs",
-      );
-    }
-  };
+      const [jobsData, failedData] = await Promise.all([
+        fetchJson<{ success: boolean; allJobs?: JobRecord[] }>("/jobs"),
+        fetchJson<{ success: boolean; jobs?: FailedJob[] }>("/failed-jobs"),
+      ]);
+      const nextJobs = jobsData?.allJobs ?? [];
 
-  const loadFailedJobs = async () => {
-    try {
-      const data = await fetchJson<{ success: boolean; jobs?: FailedJob[] }>(
-        "/failed-jobs",
+      setJobs(nextJobs);
+      setFailedJobs(failedData?.jobs ?? []);
+      // Keep the inspector in sync with the latest status of the job being viewed.
+      setSelectedJob((prev) =>
+        prev ? (nextJobs.find((job) => job._id === prev._id) ?? prev) : prev,
       );
-      setFailedJobs(data?.jobs ?? []);
+      setConnectionError("");
     } catch (err) {
-      setErrorMessage(
-        err instanceof Error ? err.message : "Unable to load failed jobs",
-      );
+      setConnectionError(errorText(err, "Unable to load jobs"));
+    } finally {
+      setIsLoading(false);
     }
-  };
+  }, []);
 
   useEffect(() => {
-    void loadJobs();
-    void loadFailedJobs();
-  }, []);
+    // Initial load + polling. Statuses change in the background (worker), so the
+    // dashboard refreshes itself instead of waiting for a manual refresh.
+    const initial = setTimeout(() => void refreshAll(), 0);
+    const interval = setInterval(() => void refreshAll(), POLL_INTERVAL_MS);
+
+    return () => {
+      clearTimeout(initial);
+      clearInterval(interval);
+    };
+  }, [refreshAll]);
+
+  const beginAction = () => {
+    setErrorMessage("");
+    setStatusMessage("");
+  };
 
   const handleTypeChange = (nextType: JobType) => {
     setJobType(nextType);
@@ -135,11 +165,18 @@ function App() {
 
   const handleCreateJob = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-    setErrorMessage("");
-    setStatusMessage("");
+    beginAction();
 
+    let parsedPayload: unknown;
     try {
-      const parsedPayload = JSON.parse(payloadText);
+      parsedPayload = JSON.parse(payloadText);
+    } catch (err) {
+      setErrorMessage(`Payload is not valid JSON: ${errorText(err, "parse error")}`);
+      return;
+    }
+
+    setIsSubmitting(true);
+    try {
       const data = await fetchJson<{ success: boolean; mongoJob?: JobRecord }>(
         "/jobs",
         {
@@ -152,73 +189,83 @@ function App() {
       setSelectedJobId(data.mongoJob?._id ?? "");
       setSelectedJob(data.mongoJob ?? null);
       setPayloadText(defaultPayloads[jobType]);
-      await loadJobs();
-      await loadFailedJobs();
+      await refreshAll();
     } catch (err) {
-      setErrorMessage(
-        err instanceof Error ? err.message : "Invalid JSON payload",
-      );
+      setErrorMessage(errorText(err, "Unable to create job"));
+    } finally {
+      setIsSubmitting(false);
     }
   };
 
   const handleCheckJob = async () => {
-    if (!selectedJobId.trim()) {
+    beginAction();
+    const id = selectedJobId.trim();
+
+    if (!id) {
       setErrorMessage("Enter a job ID to inspect.");
       return;
     }
 
     try {
       const data = await fetchJson<{ success: boolean; job?: JobRecord }>(
-        `/jobs/${selectedJobId}`,
+        `/jobs/${encodeURIComponent(id)}`,
       );
       setSelectedJob(data.job ?? null);
       setStatusMessage("Job details loaded.");
     } catch (err) {
-      setErrorMessage(
-        err instanceof Error ? err.message : "Unable to fetch job",
-      );
+      setErrorMessage(errorText(err, "Unable to fetch job"));
     }
   };
 
+  const handleViewJob = (job: JobRecord) => {
+    setSelectedJob(job);
+    setSelectedJobId(job._id ?? "");
+  };
+
   const handleDeleteJob = async (id: string) => {
+    beginAction();
     try {
       await fetchJson(`/jobs/${id}`, { method: "DELETE" });
       setStatusMessage("Job deleted.");
-      await loadJobs();
       if (selectedJob?._id === id) {
         setSelectedJob(null);
       }
+      await refreshAll();
     } catch (err) {
-      setErrorMessage(
-        err instanceof Error ? err.message : "Unable to delete job",
-      );
+      setErrorMessage(errorText(err, "Unable to delete job"));
     }
   };
 
   const handleDeleteAll = async () => {
+    if (
+      !window.confirm(
+        "Delete ALL jobs from the queue, the dead-letter queue, and the database?",
+      )
+    ) {
+      return;
+    }
+
+    beginAction();
     try {
       await fetchJson("/jobs", { method: "DELETE" });
       setStatusMessage("All jobs cleared from the queue and database.");
-      await loadJobs();
-      await loadFailedJobs();
       setSelectedJob(null);
+      await refreshAll();
     } catch (err) {
-      setErrorMessage(
-        err instanceof Error ? err.message : "Unable to clear jobs",
-      );
+      setErrorMessage(errorText(err, "Unable to clear jobs"));
     }
   };
 
-  const handleRetryFailed = async (id: string) => {
+  const handleRetryFailed = async (dlqId: string) => {
+    beginAction();
     try {
-      await fetchJson(`/failed-jobs/${id}/retry`, { method: "POST" });
+      await fetchJson(`/failed-jobs/${encodeURIComponent(dlqId)}/retry`, {
+        method: "POST",
+      });
       setStatusMessage("Failed job sent back to the queue.");
-      await loadJobs();
-      await loadFailedJobs();
+      await refreshAll();
     } catch (err) {
-      setErrorMessage(
-        err instanceof Error ? err.message : "Unable to retry job",
-      );
+      setErrorMessage(errorText(err, "Unable to retry job"));
     }
   };
 
@@ -238,10 +285,10 @@ function App() {
           <div className="flex flex-wrap items-center gap-3">
             <button
               type="button"
-              onClick={() => void loadJobs()}
+              onClick={() => void refreshAll()}
               className="inline-flex items-center justify-center rounded-xl border border-white/10 bg-white/5 px-4 py-2.5 text-sm font-medium text-slate-100 transition hover:border-violet-400/60 hover:bg-violet-500/10"
             >
-              Refresh jobs
+              Refresh
             </button>
             <button
               type="button"
@@ -262,7 +309,7 @@ function App() {
               value: jobSummary.completed,
               tone: "emerald",
             },
-            { label: "Failed", value: failedJobs.length, tone: "rose" },
+            { label: "Failed", value: jobSummary.failed, tone: "rose" },
           ].map((item) => (
             <div
               key={item.label}
@@ -325,9 +372,10 @@ function App() {
 
               <button
                 type="submit"
-                className="inline-flex w-full items-center justify-center rounded-xl bg-linear-to-r from-violet-500 to-indigo-500 px-4 py-3 text-sm font-semibold text-white shadow-lg shadow-violet-900/40 transition hover:brightness-110"
+                disabled={isSubmitting}
+                className="inline-flex w-full items-center justify-center rounded-xl bg-linear-to-r from-violet-500 to-indigo-500 px-4 py-3 text-sm font-semibold text-white shadow-lg shadow-violet-900/40 transition hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-60"
               >
-                Queue job
+                {isSubmitting ? "Queueing..." : "Queue job"}
               </button>
             </form>
           </div>
@@ -383,7 +431,7 @@ function App() {
                     </span>
                   </div>
                   <div className="flex items-center justify-between gap-4">
-                    <span className="text-slate-400">Retries</span>
+                    <span className="text-slate-400">Attempts</span>
                     <span className="font-medium text-slate-50">
                       {selectedJob.retryCount ?? 0}
                     </span>
@@ -413,8 +461,13 @@ function App() {
           </div>
         </section>
 
-        {(statusMessage || errorMessage) && (
+        {(statusMessage || errorMessage || connectionError) && (
           <div className="mb-8 space-y-3">
+            {connectionError ? (
+              <div className="rounded-2xl border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-sm text-amber-200">
+                {connectionError} Retrying every {POLL_INTERVAL_MS / 1000}s.
+              </div>
+            ) : null}
             {statusMessage ? (
               <div className="rounded-2xl border border-emerald-500/30 bg-emerald-500/10 px-4 py-3 text-sm text-emerald-200">
                 {statusMessage}
@@ -438,7 +491,9 @@ function App() {
             </span>
           </div>
 
-          {jobs.length === 0 ? (
+          {isLoading ? (
+            <p className="text-slate-400">Loading jobs...</p>
+          ) : jobs.length === 0 ? (
             <p className="text-slate-400">No jobs available yet.</p>
           ) : (
             <div className="overflow-x-auto">
@@ -448,7 +503,7 @@ function App() {
                     <th className="pb-3 pr-4 font-medium">ID</th>
                     <th className="pb-3 pr-4 font-medium">Type</th>
                     <th className="pb-3 pr-4 font-medium">Status</th>
-                    <th className="pb-3 pr-4 font-medium">Retry</th>
+                    <th className="pb-3 pr-4 font-medium">Attempts</th>
                     <th className="pb-3 font-medium">Actions</th>
                   </tr>
                 </thead>
@@ -478,7 +533,7 @@ function App() {
                         <div className="flex flex-wrap gap-2">
                           <button
                             type="button"
-                            onClick={() => setSelectedJob(job)}
+                            onClick={() => handleViewJob(job)}
                             className="rounded-lg border border-white/10 bg-white/5 px-3 py-1.5 text-xs font-medium text-slate-100 transition hover:border-violet-400/60 hover:bg-violet-500/10"
                           >
                             View
@@ -512,7 +567,9 @@ function App() {
             </span>
           </div>
 
-          {failedJobs.length === 0 ? (
+          {isLoading ? (
+            <p className="text-slate-400">Loading failed jobs...</p>
+          ) : failedJobs.length === 0 ? (
             <p className="text-slate-400">No failed jobs right now.</p>
           ) : (
             <div className="overflow-x-auto">
@@ -527,7 +584,7 @@ function App() {
                 </thead>
                 <tbody className="divide-y divide-white/5">
                   {failedJobs.map((job) => (
-                    <tr key={String(job.originalId ?? job.mongoJobId)}>
+                    <tr key={String(job.dlqId ?? job.mongoJobId)}>
                       <td className="py-3 pr-4 font-mono text-xs text-slate-300">
                         {job.originalId}
                       </td>
@@ -541,7 +598,7 @@ function App() {
                         <button
                           type="button"
                           onClick={() =>
-                            void handleRetryFailed(String(job.originalId))
+                            void handleRetryFailed(String(job.dlqId))
                           }
                           className="rounded-lg border border-emerald-500/30 bg-emerald-500/10 px-3 py-1.5 text-xs font-medium text-emerald-200 transition hover:bg-emerald-500/20"
                         >

@@ -1,4 +1,4 @@
-import express from "express";
+import express, { type ErrorRequestHandler } from "express";
 import cors from "cors";
 import morgan from "morgan";
 import helmet from "helmet";
@@ -19,5 +19,23 @@ app.get("/health", async (req, res) => {
 
 app.use("/api", jobRoutes);
 app.use("/api", dlqRoutes);
+
+// Return JSON (not Express's default HTML page) for malformed bodies and unexpected errors.
+const errorHandler: ErrorRequestHandler = (err, req, res, next) => {
+  if (res.headersSent) return next(err);
+
+  if (err?.type === "entity.parse.failed") {
+    return res
+      .status(400)
+      .json({ success: false, message: "Request body is not valid JSON." });
+  }
+
+  console.error("Unhandled error:", err);
+  return res
+    .status(500)
+    .json({ success: false, message: "Internal server error" });
+};
+
+app.use(errorHandler);
 
 export default app;

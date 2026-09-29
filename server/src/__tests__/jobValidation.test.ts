@@ -31,6 +31,26 @@ describe('validateJobInput', () => {
     assert.equal(result.ok, true);
   });
 
+  it('rejects array payloads', () => {
+    const result = validateJobInput('email', []);
+
+    assert.equal(result.ok, false);
+    assert.match(result.message, /non-array object/i);
+  });
+
+  it('rejects pdf payloads with blank content', () => {
+    const result = validateJobInput('pdf', { content: '   ' });
+
+    assert.equal(result.ok, false);
+    assert.match(result.message, /non-empty content/i);
+  });
+
+  it('rejects the unsupported image type', () => {
+    const result = validateJobInput('image', {});
+
+    assert.equal(result.ok, false);
+  });
+
   it('rejects unrecognized job types', () => {
     const result = validateJobInput('unknown', {});
 

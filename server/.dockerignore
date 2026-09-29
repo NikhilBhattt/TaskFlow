@@ -2,4 +2,7 @@ node_modules
 dist
 .git
 .env
+.env.*
 reports
+*.md
+load-test.mjs
