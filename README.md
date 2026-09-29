@@ -228,6 +228,15 @@ curl -X POST http://localhost:8000/api/jobs \
 - **Dead letter queue:** failed jobs with their error, failure time and a *Retry* button.
 - The dashboard **polls the API every 3 seconds**, so statuses update on their own. If the API is unreachable it shows a banner and keeps retrying.
 - It follows the system light/dark setting and adapts to phone screens (short IDs, secondary columns hidden).
+=======
+- **Create job:** choose Email or PDF, edit the JSON payload, and press *Queue job*. Malformed JSON and server-side validation errors are shown inline.
+- **Counters:** total, active (`queued` + `processing`), completed and failed, computed from the job list.
+- **Job history:** every job with type, status and attempts, plus *View* and *Delete*.
+- **Job inspector:** paste a job id and press *Inspect* (or press *View* on a row) to see status, attempts, error and the PDF link. It refreshes with the job while you look at it.
+- **Dead letter queue:** failed jobs with their error and a *Retry* button.
+- **Refresh / Clear all:** *Refresh* reloads everything immediately. *Clear all* asks for confirmation, then empties both queues and the database.
+- The dashboard **polls the API every 3 seconds**, so statuses update on their own. If the API is unreachable it shows a banner and keeps retrying.
+>>>>>>> e5a50e0741f242b6c4ec230b8426801a7662d499
 
 <!--
 Screenshots: add image files under docs/screenshots/ and link them here, for example:
@@ -285,6 +294,7 @@ Production build of each part: `npm run build` at the root (runs `tsc` for the s
 
 ## Docker
 
+<<<<<<< HEAD
 `docker-compose.yml` at the repository root starts four services: the React client (built in `client/Dockerfile`, served by nginx), the API with its worker (built from `server/Dockerfile`), MongoDB and Redis.
 
 ```bash
