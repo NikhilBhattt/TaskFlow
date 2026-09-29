@@ -3,6 +3,5 @@ dist
 .git
 .env
 .env.*
-reports
+!.env.example
 *.md
-load-test.mjs

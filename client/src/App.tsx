@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 
 type JobType = "email" | "pdf";
 
@@ -15,10 +15,16 @@ type JobRecord = {
 };
 
 type FailedJob = {
+  dlqId?: string;
+  failedAt?: string;
   originalId?: string;
   mongoJobId?: string;
+  originalType?: string;
   error?: string;
 };
+
+const API_BASE = `${import.meta.env.VITE_API_URL ?? ""}/api`;
+const POLL_INTERVAL_MS = 3000;
 
 const defaultPayloads: Record<JobType, string> = {
   email: JSON.stringify(
@@ -32,7 +38,6 @@ const defaultPayloads: Record<JobType, string> = {
   ),
   pdf: JSON.stringify(
     {
-      title: "Monthly Executive Summary",
       content:
         "Customer activity trends, operational health, and key business milestones.",
     },
@@ -41,37 +46,83 @@ const defaultPayloads: Record<JobType, string> = {
   ),
 };
 
-const statusClasses: Record<string, string> = {
-  queued: "bg-sky-500/10 text-sky-300 ring-1 ring-sky-500/30",
-  processing: "bg-amber-500/10 text-amber-300 ring-1 ring-amber-500/30",
-  completed: "bg-emerald-500/10 text-emerald-300 ring-1 ring-emerald-500/30",
-  failed: "bg-rose-500/10 text-rose-300 ring-1 ring-rose-500/30",
-  cancelled: "bg-slate-500/10 text-slate-300 ring-1 ring-slate-500/30",
+const payloadHints: Record<JobType, string> = {
+  email:
+    "Required fields: to, subject, message. Sent through Gmail SMTP; without credentials the job fails and ends up in the dead letter queue.",
+  pdf: "Required field: content. The PDF is uploaded to Cloudinary; without credentials the job fails and ends up in the dead letter queue.",
 };
 
-const toneClasses: Record<string, string> = {
-  violet: "bg-violet-500",
-  sky: "bg-sky-500",
-  emerald: "bg-emerald-500",
-  rose: "bg-rose-500",
+const formatTime = (value?: string | Date) => {
+  if (!value) return "-";
+  const date = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(date.getTime())) return "-";
+  return date.toLocaleString(undefined, {
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  });
 };
+
+const formatClock = (date: Date) =>
+  date.toLocaleTimeString(undefined, {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  });
+
+const typeLabel = (type?: string) =>
+  type === "pdf" ? "PDF" : type === "email" ? "Email" : (type ?? "Job");
+
+// Full ID on wide screens, short tail on phones (the full ID stays in the tooltip).
+function JobId({ id }: { id?: string }) {
+  if (!id) return null;
+  return (
+    <div className="id-text" title={id}>
+      <span className="hidden sm:inline">{id}</span>
+      <span className="whitespace-nowrap sm:hidden">...{id.slice(-8)}</span>
+    </div>
+  );
+}
+
+const KNOWN_STATUSES = ["queued", "processing", "completed", "failed", "cancelled"];
+
+function StatusBadge({ status }: { status?: string }) {
+  const value = status && KNOWN_STATUSES.includes(status) ? status : "queued";
+  return <span className={`status status-${value}`}>{status ?? "queued"}</span>;
+}
+
+class ApiUnreachableError extends Error {
+  constructor() {
+    super("Cannot reach the TaskFlow API. Is the server running?");
+  }
+}
+
+const errorText = (err: unknown, fallback: string) =>
+  err instanceof Error ? err.message : fallback;
 
 async function fetchJson<T>(
   path: string,
   options: RequestInit = {},
 ): Promise<T> {
-  const response = await fetch(`/api${path}`, {
-    headers: {
-      "Content-Type": "application/json",
-      ...(options.headers || {}),
-    },
-    ...options,
-  });
+  let response: Response;
+  try {
+    response = await fetch(`${API_BASE}${path}`, {
+      headers: {
+        "Content-Type": "application/json",
+        ...(options.headers || {}),
+      },
+      ...options,
+    });
+  } catch {
+    throw new ApiUnreachableError();
+  }
 
   const data = await response.json().catch(() => ({}));
 
   if (!response.ok) {
-    throw new Error(data?.message || "Request failed");
+    throw new Error(data?.message || `Request failed (HTTP ${response.status})`);
   }
 
   return data as T;
@@ -84,49 +135,79 @@ function App() {
   const [failedJobs, setFailedJobs] = useState<FailedJob[]>([]);
   const [statusMessage, setStatusMessage] = useState("");
   const [errorMessage, setErrorMessage] = useState("");
+  const [connectionError, setConnectionError] = useState("");
+  const [isLoading, setIsLoading] = useState(true);
+  const [isSubmitting, setIsSubmitting] = useState(false);
   const [selectedJobId, setSelectedJobId] = useState("");
   const [selectedJob, setSelectedJob] = useState<JobRecord | null>(null);
+  const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
+
+  // Live hint under the payload box; the submit handler still validates on its own.
+  const payloadError = useMemo(() => {
+    try {
+      JSON.parse(payloadText);
+      return "";
+    } catch (err) {
+      return errorText(err, "Invalid JSON");
+    }
+  }, [payloadText]);
 
   const jobSummary = useMemo(() => {
-    const active = jobs.filter((job) =>
-      ["queued", "processing"].includes(job.status ?? ""),
-    ).length;
+    const queued = jobs.filter((job) => job.status === "queued").length;
+    const processing = jobs.filter((job) => job.status === "processing").length;
     const completed = jobs.filter((job) => job.status === "completed").length;
     const failed = jobs.filter((job) => job.status === "failed").length;
 
-    return { total: jobs.length, active, completed, failed };
+    return {
+      total: jobs.length,
+      queued,
+      processing,
+      active: queued + processing,
+      completed,
+      failed,
+    };
   }, [jobs]);
 
-  const loadJobs = async () => {
+  // Loads jobs + dead-letter queue together. Used for polling and after every action.
+  const refreshAll = useCallback(async () => {
     try {
-      const data = await fetchJson<{ success: boolean; allJobs?: JobRecord[] }>(
-        "/jobs",
-      );
-      setJobs(data?.allJobs ?? []);
-    } catch (err) {
-      setErrorMessage(
-        err instanceof Error ? err.message : "Unable to load jobs",
-      );
-    }
-  };
+      const [jobsData, failedData] = await Promise.all([
+        fetchJson<{ success: boolean; allJobs?: JobRecord[] }>("/jobs"),
+        fetchJson<{ success: boolean; jobs?: FailedJob[] }>("/failed-jobs"),
+      ]);
+      const nextJobs = jobsData?.allJobs ?? [];
 
-  const loadFailedJobs = async () => {
-    try {
-      const data = await fetchJson<{ success: boolean; jobs?: FailedJob[] }>(
-        "/failed-jobs",
+      setJobs(nextJobs);
+      setFailedJobs(failedData?.jobs ?? []);
+      // Keep the inspector in sync with the latest status of the job being viewed.
+      setSelectedJob((prev) =>
+        prev ? (nextJobs.find((job) => job._id === prev._id) ?? prev) : prev,
       );
-      setFailedJobs(data?.jobs ?? []);
+      setConnectionError("");
+      setLastUpdated(new Date());
     } catch (err) {
-      setErrorMessage(
-        err instanceof Error ? err.message : "Unable to load failed jobs",
-      );
+      setConnectionError(errorText(err, "Unable to load jobs"));
+    } finally {
+      setIsLoading(false);
     }
-  };
+  }, []);
 
   useEffect(() => {
-    void loadJobs();
-    void loadFailedJobs();
-  }, []);
+    // Initial load + polling. Statuses change in the background (worker), so the
+    // dashboard refreshes itself instead of waiting for a manual refresh.
+    const initial = setTimeout(() => void refreshAll(), 0);
+    const interval = setInterval(() => void refreshAll(), POLL_INTERVAL_MS);
+
+    return () => {
+      clearTimeout(initial);
+      clearInterval(interval);
+    };
+  }, [refreshAll]);
+
+  const beginAction = () => {
+    setErrorMessage("");
+    setStatusMessage("");
+  };
 
   const handleTypeChange = (nextType: JobType) => {
     setJobType(nextType);
@@ -135,11 +216,18 @@ function App() {
 
   const handleCreateJob = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-    setErrorMessage("");
-    setStatusMessage("");
+    beginAction();
 
+    let parsedPayload: unknown;
     try {
-      const parsedPayload = JSON.parse(payloadText);
+      parsedPayload = JSON.parse(payloadText);
+    } catch (err) {
+      setErrorMessage(`Payload is not valid JSON: ${errorText(err, "parse error")}`);
+      return;
+    }
+
+    setIsSubmitting(true);
+    try {
       const data = await fetchJson<{ success: boolean; mongoJob?: JobRecord }>(
         "/jobs",
         {
@@ -152,410 +240,506 @@ function App() {
       setSelectedJobId(data.mongoJob?._id ?? "");
       setSelectedJob(data.mongoJob ?? null);
       setPayloadText(defaultPayloads[jobType]);
-      await loadJobs();
-      await loadFailedJobs();
+      await refreshAll();
     } catch (err) {
-      setErrorMessage(
-        err instanceof Error ? err.message : "Invalid JSON payload",
-      );
+      setErrorMessage(errorText(err, "Unable to create job"));
+    } finally {
+      setIsSubmitting(false);
     }
   };
 
   const handleCheckJob = async () => {
-    if (!selectedJobId.trim()) {
+    beginAction();
+    const id = selectedJobId.trim();
+
+    if (!id) {
       setErrorMessage("Enter a job ID to inspect.");
       return;
     }
 
     try {
       const data = await fetchJson<{ success: boolean; job?: JobRecord }>(
-        `/jobs/${selectedJobId}`,
+        `/jobs/${encodeURIComponent(id)}`,
       );
       setSelectedJob(data.job ?? null);
       setStatusMessage("Job details loaded.");
     } catch (err) {
-      setErrorMessage(
-        err instanceof Error ? err.message : "Unable to fetch job",
-      );
+      setErrorMessage(errorText(err, "Unable to fetch job"));
     }
   };
 
+  const handleViewJob = (job: JobRecord) => {
+    setSelectedJob(job);
+    setSelectedJobId(job._id ?? "");
+  };
+
   const handleDeleteJob = async (id: string) => {
+    beginAction();
     try {
       await fetchJson(`/jobs/${id}`, { method: "DELETE" });
       setStatusMessage("Job deleted.");
-      await loadJobs();
       if (selectedJob?._id === id) {
         setSelectedJob(null);
       }
+      await refreshAll();
     } catch (err) {
-      setErrorMessage(
-        err instanceof Error ? err.message : "Unable to delete job",
-      );
+      setErrorMessage(errorText(err, "Unable to delete job"));
     }
   };
 
   const handleDeleteAll = async () => {
+    if (
+      !window.confirm(
+        "Delete ALL jobs from the queue, the dead-letter queue, and the database?",
+      )
+    ) {
+      return;
+    }
+
+    beginAction();
     try {
       await fetchJson("/jobs", { method: "DELETE" });
       setStatusMessage("All jobs cleared from the queue and database.");
-      await loadJobs();
-      await loadFailedJobs();
       setSelectedJob(null);
+      await refreshAll();
     } catch (err) {
-      setErrorMessage(
-        err instanceof Error ? err.message : "Unable to clear jobs",
-      );
+      setErrorMessage(errorText(err, "Unable to clear jobs"));
     }
   };
 
-  const handleRetryFailed = async (id: string) => {
+  const handleRetryFailed = async (dlqId: string) => {
+    beginAction();
     try {
-      await fetchJson(`/failed-jobs/${id}/retry`, { method: "POST" });
+      await fetchJson(`/failed-jobs/${encodeURIComponent(dlqId)}/retry`, {
+        method: "POST",
+      });
       setStatusMessage("Failed job sent back to the queue.");
-      await loadJobs();
-      await loadFailedJobs();
+      await refreshAll();
     } catch (err) {
-      setErrorMessage(
-        err instanceof Error ? err.message : "Unable to retry job",
-      );
+      setErrorMessage(errorText(err, "Unable to retry job"));
     }
   };
+
+  const percent = (count: number) =>
+    jobSummary.total ? (count / jobSummary.total) * 100 : 0;
+
+  const stats = [
+    {
+      label: "Total jobs",
+      value: jobSummary.total,
+      dot: "var(--color-ink)",
+      note: "",
+    },
+    {
+      label: "Active",
+      value: jobSummary.active,
+      dot: "var(--color-queued)",
+      note: `${jobSummary.queued} queued, ${jobSummary.processing} processing`,
+    },
+    {
+      label: "Completed",
+      value: jobSummary.completed,
+      dot: "var(--color-completed)",
+      note: "",
+    },
+    {
+      label: "Failed",
+      value: jobSummary.failed,
+      dot: "var(--color-failed)",
+      note: `${failedJobs.length} in the dead letter queue`,
+    },
+  ];
 
   return (
-    <div className="min-h-screen bg-slate-950 text-slate-50">
-      <div className="mx-auto max-w-7xl px-4 py-8 sm:px-6 lg:px-8">
-        <header className="mb-8 flex flex-col gap-6 rounded-3xl border border-white/10 bg-slate-900/80 p-6 shadow-2xl shadow-slate-950/40 backdrop-blur sm:p-8 lg:flex-row lg:items-center lg:justify-between">
+    <div className="mx-auto max-w-6xl space-y-6 px-4 py-6 sm:px-6 lg:py-10">
+      <header className="flex flex-wrap items-center justify-between gap-4">
+        <div className="flex items-center gap-3">
+          <svg
+            width="36"
+            height="36"
+            viewBox="0 0 32 32"
+            aria-hidden="true"
+            className="shrink-0"
+          >
+            <rect width="32" height="32" rx="7" className="fill-accent" />
+            <path
+              d="M8 10h16M8 16h10M8 22h13"
+              className="stroke-on-accent"
+              strokeWidth="3"
+              strokeLinecap="round"
+              fill="none"
+            />
+          </svg>
           <div>
-            <p className="mb-2 text-xs font-semibold uppercase tracking-[0.24em] text-violet-300">
-              TaskFlow
-            </p>
-            <h1 className="text-3xl font-semibold tracking-tight text-white sm:text-4xl">
-              Background job control center
-            </h1>
+            <h1 className="text-xl leading-tight font-semibold">TaskFlow</h1>
+            <p className="text-sm text-muted">Background job control center</p>
           </div>
+        </div>
 
-          <div className="flex flex-wrap items-center gap-3">
-            <button
-              type="button"
-              onClick={() => void loadJobs()}
-              className="inline-flex items-center justify-center rounded-xl border border-white/10 bg-white/5 px-4 py-2.5 text-sm font-medium text-slate-100 transition hover:border-violet-400/60 hover:bg-violet-500/10"
-            >
-              Refresh jobs
-            </button>
-            <button
-              type="button"
-              onClick={() => void handleDeleteAll()}
-              className="inline-flex items-center justify-center rounded-xl bg-rose-500 px-4 py-2.5 text-sm font-semibold text-white transition hover:bg-rose-400"
-            >
-              Clear all
-            </button>
-          </div>
-        </header>
+        <div className="flex flex-wrap items-center gap-3">
+          <p
+            className={`status w-full sm:w-auto ${connectionError ? "status-failed" : lastUpdated ? "status-completed" : "status-cancelled"}`}
+            aria-live="polite"
+          >
+            {connectionError
+              ? "API unreachable"
+              : lastUpdated
+                ? `Live, updated ${formatClock(lastUpdated)}`
+                : "Connecting"}
+          </p>
+          <button
+            type="button"
+            onClick={() => void refreshAll()}
+            className="btn btn-secondary"
+          >
+            Refresh
+          </button>
+          <button
+            type="button"
+            onClick={() => void handleDeleteAll()}
+            className="btn btn-danger"
+          >
+            Clear all
+          </button>
+        </div>
+      </header>
 
-        <section className="mb-8 grid gap-4 md:grid-cols-2 xl:grid-cols-4">
-          {[
-            { label: "Total jobs", value: jobSummary.total, tone: "violet" },
-            { label: "Active", value: jobSummary.active, tone: "sky" },
-            {
-              label: "Completed",
-              value: jobSummary.completed,
-              tone: "emerald",
-            },
-            { label: "Failed", value: failedJobs.length, tone: "rose" },
-          ].map((item) => (
+      {(statusMessage || errorMessage || connectionError) && (
+        <div className="space-y-2">
+          {connectionError ? (
+            <div role="alert" className="notice border-l-processing">
+              {connectionError} Retrying every {POLL_INTERVAL_MS / 1000}s.
+            </div>
+          ) : null}
+          {statusMessage ? (
+            <div role="status" className="notice border-l-completed">
+              {statusMessage}
+            </div>
+          ) : null}
+          {errorMessage ? (
+            <div role="alert" className="notice border-l-failed">
+              {errorMessage}
+            </div>
+          ) : null}
+        </div>
+      )}
+
+      <section aria-label="Job summary" className="panel overflow-hidden">
+        <div className="grid grid-cols-2 gap-px bg-line lg:grid-cols-4">
+          {stats.map((item) => (
             <div
               key={item.label}
-              className="rounded-2xl border border-white/10 bg-linear-to from-slate-900 to-slate-800 p-5 shadow-lg shadow-slate-950/30"
+              className="bg-surface p-5"
+              style={{ "--dot": item.dot } as React.CSSProperties}
             >
-              <p className="text-sm text-slate-300">{item.label}</p>
-              <div className="mt-4 flex items-end justify-between">
-                <span className="text-3xl font-bold text-white">
-                  {item.value}
-                </span>
-                <span
-                  className={`inline-flex h-3 w-3 rounded-full ring-2 ring-white/10 ${toneClasses[item.tone as keyof typeof toneClasses] ?? "bg-slate-500"}`}
-                  aria-label={`${item.label} tone`}
-                  title={item.tone}
-                />
-              </div>
+              <p className="stat-label">{item.label}</p>
+              <span className="stat-value mt-2 block">{item.value}</span>
+              {item.note ? (
+                <p className="mt-1 text-xs text-muted">{item.note}</p>
+              ) : null}
             </div>
           ))}
+        </div>
+        <div
+          role="img"
+          aria-label={`Job distribution: ${jobSummary.active} active, ${jobSummary.completed} completed, ${jobSummary.failed} failed`}
+          className="flex h-2 bg-sunken"
+        >
+          <div
+            className="bg-queued transition-[width] duration-500"
+            style={{ width: `${percent(jobSummary.active)}%` }}
+          />
+          <div
+            className="bg-completed transition-[width] duration-500"
+            style={{ width: `${percent(jobSummary.completed)}%` }}
+          />
+          <div
+            className="bg-failed transition-[width] duration-500"
+            style={{ width: `${percent(jobSummary.failed)}%` }}
+          />
+        </div>
+      </section>
+
+      <div className="grid gap-6 lg:grid-cols-[minmax(0,1.15fr)_minmax(0,1fr)]">
+        <section className="panel p-5 sm:p-6">
+          <h2 className="panel-title">Create new job</h2>
+
+          <form className="mt-5 space-y-5" onSubmit={handleCreateJob}>
+            <div>
+              <span id="job-type-label" className="mb-2 block text-sm font-medium">
+                Job type
+              </span>
+              <div
+                role="group"
+                aria-labelledby="job-type-label"
+                className="segment-group"
+              >
+                {(["email", "pdf"] as JobType[]).map((type) => (
+                  <button
+                    key={type}
+                    type="button"
+                    className="segment"
+                    aria-pressed={jobType === type}
+                    onClick={() => handleTypeChange(type)}
+                  >
+                    {type === "email" ? "Email" : "PDF"}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <div>
+              <label htmlFor="payload" className="mb-2 block text-sm font-medium">
+                Payload JSON
+              </label>
+              <textarea
+                id="payload"
+                rows={10}
+                spellCheck={false}
+                value={payloadText}
+                onChange={(event) => setPayloadText(event.target.value)}
+                className="field font-mono leading-relaxed"
+              />
+              <p
+                className={`mt-2 text-xs ${payloadError ? "text-failed" : "text-muted"}`}
+              >
+                {payloadError
+                  ? `Not valid JSON yet: ${payloadError}`
+                  : payloadHints[jobType]}
+              </p>
+            </div>
+
+            <button
+              type="submit"
+              disabled={isSubmitting}
+              className="btn btn-primary w-full"
+            >
+              {isSubmitting ? "Queueing..." : "Queue job"}
+            </button>
+          </form>
         </section>
 
-        <section className="mb-8 grid gap-6 xl:grid-cols-[1.5fr_0.95fr]">
-          <div className="rounded-3xl border border-white/10 bg-slate-900/80 p-6 shadow-xl shadow-slate-950/30">
-            <div className="mb-5 flex items-center justify-between">
-              <h2 className="text-xl font-semibold text-white">
-                Create new job
-              </h2>
-              <span className="rounded-full border border-violet-500/30 bg-violet-500/10 px-2.5 py-1 text-xs font-medium text-violet-200">
-                Async queue
-              </span>
-            </div>
+        <section className="panel p-5 sm:p-6">
+          <h2 className="panel-title">Job inspector</h2>
 
-            <form className="space-y-5" onSubmit={handleCreateJob}>
-              <div>
-                <label className="mb-2 block text-sm font-medium text-slate-200">
-                  Job type
-                </label>
-                <select
-                  value={jobType}
-                  onChange={(event) =>
-                    handleTypeChange(event.target.value as JobType)
-                  }
-                  className="w-full rounded-xl border border-white/10 bg-slate-950/80 px-3 py-3 text-sm text-slate-50 outline-none transition focus:border-violet-400 focus:ring-2 focus:ring-violet-500/30"
-                >
-                  <option value="email">Email</option>
-                  <option value="pdf">PDF</option>
-                </select>
-              </div>
-
-              <div>
-                <label className="mb-2 block text-sm font-medium text-slate-200">
-                  Payload JSON
-                </label>
-                <textarea
-                  rows={14}
-                  value={payloadText}
-                  onChange={(event) => setPayloadText(event.target.value)}
-                  className="w-full rounded-2xl border border-white/10 bg-slate-950/80 px-3 py-3 font-mono text-sm text-slate-100 outline-none transition focus:border-violet-400 focus:ring-2 focus:ring-violet-500/30"
-                />
-              </div>
-
-              <button
-                type="submit"
-                className="inline-flex w-full items-center justify-center rounded-xl bg-linear-to-r from-violet-500 to-indigo-500 px-4 py-3 text-sm font-semibold text-white shadow-lg shadow-violet-900/40 transition hover:brightness-110"
-              >
-                Queue job
-              </button>
-            </form>
+          <div className="mt-5 flex gap-2">
+            <input
+              type="text"
+              value={selectedJobId}
+              onChange={(event) => setSelectedJobId(event.target.value)}
+              placeholder="Paste job id"
+              aria-label="Job ID"
+              spellCheck={false}
+              className="field font-mono"
+            />
+            <button
+              type="button"
+              onClick={() => void handleCheckJob()}
+              className="btn btn-secondary"
+            >
+              Inspect
+            </button>
           </div>
 
-          <div className="rounded-3xl border border-white/10 bg-slate-900/80 p-6 shadow-xl shadow-slate-950/30">
-            <div className="mb-5 flex items-center justify-between">
-              <h2 className="text-xl font-semibold text-white">
-                Job inspector
-              </h2>
-              <span className="text-xs uppercase tracking-[0.2em] text-slate-400">
-                Lookup
-              </span>
-            </div>
-
-            <div className="flex gap-3">
-              <input
-                type="text"
-                value={selectedJobId}
-                onChange={(event) => setSelectedJobId(event.target.value)}
-                placeholder="Paste job id"
-                className="w-full rounded-xl border border-white/10 bg-slate-950/80 px-3 py-2.5 text-sm text-slate-50 outline-none transition focus:border-violet-400 focus:ring-2 focus:ring-violet-500/30"
-              />
-              <button
-                type="button"
-                onClick={() => void handleCheckJob()}
-                className="rounded-xl border border-violet-500/30 bg-violet-500/10 px-4 py-2.5 text-sm font-medium text-violet-100 transition hover:bg-violet-500/20"
-              >
-                Inspect
-              </button>
-            </div>
-
-            <div className="mt-5 rounded-2xl border border-white/10 bg-slate-950/60 p-4">
-              {selectedJob ? (
-                <div className="space-y-3 text-sm text-slate-200">
-                  <div className="flex items-center justify-between gap-4">
-                    <span className="text-slate-400">ID</span>
-                    <span className="truncate font-medium text-slate-50">
-                      {selectedJob._id}
-                    </span>
+          <div className="mt-5 border-t border-line pt-5">
+            {selectedJob ? (
+              <dl className="space-y-3 text-sm">
+                <div>
+                  <dt className="text-muted">ID</dt>
+                  <dd className="id-text mt-0.5">{selectedJob._id}</dd>
+                </div>
+                <div className="grid grid-cols-3 gap-4">
+                  <div>
+                    <dt className="text-muted">Type</dt>
+                    <dd className="mt-0.5 font-medium">
+                      {typeLabel(selectedJob.type)}
+                    </dd>
                   </div>
-                  <div className="flex items-center justify-between gap-4">
-                    <span className="text-slate-400">Type</span>
-                    <span className="font-medium text-slate-50">
-                      {selectedJob.type}
-                    </span>
+                  <div>
+                    <dt className="text-muted">Status</dt>
+                    <dd className="mt-0.5">
+                      <StatusBadge status={selectedJob.status} />
+                    </dd>
                   </div>
-                  <div className="flex items-center justify-between gap-4">
-                    <span className="text-slate-400">Status</span>
-                    <span
-                      className={`rounded-full px-2.5 py-1 text-xs font-medium ${statusClasses[selectedJob.status ?? "queued"] ?? statusClasses.queued}`}
-                    >
-                      {selectedJob.status}
-                    </span>
-                  </div>
-                  <div className="flex items-center justify-between gap-4">
-                    <span className="text-slate-400">Retries</span>
-                    <span className="font-medium text-slate-50">
+                  <div>
+                    <dt className="text-muted">Attempts</dt>
+                    <dd className="mt-0.5 font-medium tabular-nums">
                       {selectedJob.retryCount ?? 0}
-                    </span>
+                    </dd>
                   </div>
+                </div>
+                <div>
+                  <dt className="text-muted">Created</dt>
+                  <dd className="mt-0.5">{formatTime(selectedJob.createdAt)}</dd>
+                </div>
 
-                  {selectedJob.pdfUrl ? (
+                {selectedJob.error ? (
+                  <div className="rounded-md border border-failed/40 bg-failed/10 p-3 text-failed">
+                    {selectedJob.error}
+                  </div>
+                ) : null}
+
+                {selectedJob.pdfUrl ? (
+                  <div>
                     <a
                       href={selectedJob.pdfUrl}
                       target="_blank"
                       rel="noreferrer"
-                      className="mt-3 inline-flex rounded-lg border border-emerald-500/30 bg-emerald-500/10 px-3 py-2 text-sm font-medium text-emerald-200 transition hover:bg-emerald-500/20"
+                      className="link"
                     >
                       Open generated PDF
                     </a>
-                  ) : null}
+                  </div>
+                ) : null}
 
-                  {selectedJob.error ? (
-                    <div className="rounded-xl border border-rose-500/30 bg-rose-500/10 p-3 text-rose-200">
-                      {selectedJob.error}
-                    </div>
-                  ) : null}
-                </div>
-              ) : (
-                <p className="text-sm text-slate-400">No job selected yet.</p>
-              )}
-            </div>
+                {selectedJob.payload ? (
+                  <details>
+                    <summary className="cursor-pointer text-muted">
+                      Payload
+                    </summary>
+                    <pre className="id-text mt-2 max-h-48 overflow-auto rounded-md bg-sunken p-3 whitespace-pre-wrap">
+                      {JSON.stringify(selectedJob.payload, null, 2)}
+                    </pre>
+                  </details>
+                ) : null}
+              </dl>
+            ) : (
+              <p className="text-sm text-muted">
+                Choose View on a job below, or paste an ID above.
+              </p>
+            )}
           </div>
         </section>
+      </div>
 
-        {(statusMessage || errorMessage) && (
-          <div className="mb-8 space-y-3">
-            {statusMessage ? (
-              <div className="rounded-2xl border border-emerald-500/30 bg-emerald-500/10 px-4 py-3 text-sm text-emerald-200">
-                {statusMessage}
-              </div>
-            ) : null}
-            {errorMessage ? (
-              <div className="rounded-2xl border border-rose-500/30 bg-rose-500/10 px-4 py-3 text-sm text-rose-200">
-                {errorMessage}
-              </div>
-            ) : null}
-          </div>
-        )}
+      <section className="panel">
+        <div className="flex flex-wrap items-baseline justify-between gap-2 px-5 pt-5 sm:px-6">
+          <h2 className="panel-title">Job history</h2>
+          <span className="text-sm text-muted">
+            {jobs.length} {jobs.length === 1 ? "job" : "jobs"}, newest first
+          </span>
+        </div>
 
-        <section className="mb-8 rounded-3xl border border-white/10 bg-slate-900/80 p-6 shadow-xl shadow-slate-950/30">
-          <div className="mb-5 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-            <h2 className="text-xl font-semibold text-white">
-              Job history
-            </h2>
-            <span className="text-sm text-slate-400">
-              {jobs.length} total records
-            </span>
-          </div>
-
-          {jobs.length === 0 ? (
-            <p className="text-slate-400">No jobs available yet.</p>
-          ) : (
-            <div className="overflow-x-auto">
-              <table className="min-w-full divide-y divide-white/10 text-left text-sm text-slate-200">
-                <thead>
-                  <tr className="text-slate-400">
-                    <th className="pb-3 pr-4 font-medium">ID</th>
-                    <th className="pb-3 pr-4 font-medium">Type</th>
-                    <th className="pb-3 pr-4 font-medium">Status</th>
-                    <th className="pb-3 pr-4 font-medium">Retry</th>
-                    <th className="pb-3 font-medium">Actions</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-white/5">
-                  {jobs.map((job) => (
-                    <tr
-                      key={String(job._id ?? job.type)}
-                      className="align-middle"
-                    >
-                      <td className="py-3 pr-4 font-mono text-xs text-slate-300">
-                        {job._id}
-                      </td>
-                      <td className="py-3 pr-4 capitalize text-slate-100">
-                        {job.type}
-                      </td>
-                      <td className="py-3 pr-4">
-                        <span
-                          className={`rounded-full px-2.5 py-1 text-xs font-medium ${statusClasses[job.status ?? "queued"] ?? statusClasses.queued}`}
-                        >
-                          {job.status}
-                        </span>
-                      </td>
-                      <td className="py-3 pr-4 text-slate-100">
-                        {job.retryCount ?? 0}
-                      </td>
-                      <td className="py-3">
-                        <div className="flex flex-wrap gap-2">
-                          <button
-                            type="button"
-                            onClick={() => setSelectedJob(job)}
-                            className="rounded-lg border border-white/10 bg-white/5 px-3 py-1.5 text-xs font-medium text-slate-100 transition hover:border-violet-400/60 hover:bg-violet-500/10"
-                          >
-                            View
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() =>
-                              void handleDeleteJob(String(job._id))
-                            }
-                            className="rounded-lg bg-rose-500/90 px-3 py-1.5 text-xs font-medium text-white transition hover:bg-rose-400"
-                          >
-                            Delete
-                          </button>
-                        </div>
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          )}
-        </section>
-
-        <section className="rounded-3xl border border-white/10 bg-slate-900/80 p-6 shadow-xl shadow-slate-950/30">
-          <div className="mb-5 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-            <h2 className="text-xl font-semibold text-white">
-              Dead letter queue
-            </h2>
-            <span className="text-sm text-slate-400">
-              {failedJobs.length} failed records
-            </span>
-          </div>
-
-          {failedJobs.length === 0 ? (
-            <p className="text-slate-400">No failed jobs right now.</p>
-          ) : (
-            <div className="overflow-x-auto">
-              <table className="min-w-full divide-y divide-white/10 text-left text-sm text-slate-200">
-                <thead>
-                  <tr className="text-slate-400">
-                    <th className="pb-3 pr-4 font-medium">Original ID</th>
-                    <th className="pb-3 pr-4 font-medium">Mongo ID</th>
-                    <th className="pb-3 pr-4 font-medium">Error</th>
-                    <th className="pb-3 font-medium">Retry</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-white/5">
-                  {failedJobs.map((job) => (
-                    <tr key={String(job.originalId ?? job.mongoJobId)}>
-                      <td className="py-3 pr-4 font-mono text-xs text-slate-300">
-                        {job.originalId}
-                      </td>
-                      <td className="py-3 pr-4 font-mono text-xs text-slate-300">
-                        {job.mongoJobId}
-                      </td>
-                      <td className="py-3 pr-4 text-rose-200">
-                        {job.error ?? "Unknown error"}
-                      </td>
-                      <td className="py-3">
+        {isLoading ? (
+          <p className="px-5 py-8 text-sm text-muted sm:px-6">Loading jobs...</p>
+        ) : jobs.length === 0 ? (
+          <p className="px-5 py-8 text-sm text-muted sm:px-6">
+            No jobs yet. Queue one above and it will show up here.
+          </p>
+        ) : (
+          <div className="mt-3 overflow-x-auto">
+            <table className="table">
+              <thead>
+                <tr>
+                  <th>Job</th>
+                  <th>Status</th>
+                  <th className="hidden sm:table-cell">Attempts</th>
+                  <th className="hidden sm:table-cell">Created</th>
+                  <th className="text-right">Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                {jobs.map((job) => (
+                  <tr key={String(job._id ?? job.type)}>
+                    <td>
+                      <div className="font-medium">{typeLabel(job.type)}</div>
+                      <JobId id={job._id} />
+                    </td>
+                    <td>
+                      <StatusBadge status={job.status} />
+                    </td>
+                    <td className="hidden tabular-nums sm:table-cell">
+                      {job.retryCount ?? 0}
+                    </td>
+                    <td className="hidden whitespace-nowrap text-muted sm:table-cell">
+                      {formatTime(job.createdAt)}
+                    </td>
+                    <td>
+                      <div className="flex flex-col items-stretch gap-2 sm:flex-row sm:items-center sm:justify-end">
                         <button
                           type="button"
-                          onClick={() =>
-                            void handleRetryFailed(String(job.originalId))
-                          }
-                          className="rounded-lg border border-emerald-500/30 bg-emerald-500/10 px-3 py-1.5 text-xs font-medium text-emerald-200 transition hover:bg-emerald-500/20"
+                          onClick={() => handleViewJob(job)}
+                          className="btn btn-secondary btn-sm"
+                        >
+                          View
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => void handleDeleteJob(String(job._id))}
+                          className="btn btn-danger btn-sm"
+                        >
+                          Delete
+                        </button>
+                      </div>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </section>
+
+      <section className="panel">
+        <div className="flex flex-wrap items-baseline justify-between gap-2 px-5 pt-5 sm:px-6">
+          <h2 className="panel-title">Dead letter queue</h2>
+          <span className="text-sm text-muted">
+            {failedJobs.length} {failedJobs.length === 1 ? "entry" : "entries"}
+          </span>
+        </div>
+
+        {isLoading ? (
+          <p className="px-5 py-8 text-sm text-muted sm:px-6">
+            Loading failed jobs...
+          </p>
+        ) : failedJobs.length === 0 ? (
+          <p className="px-5 py-8 text-sm text-muted sm:px-6">
+            No failed jobs. Jobs land here after all 3 attempts fail.
+          </p>
+        ) : (
+          <div className="mt-3 overflow-x-auto">
+            <table className="table">
+              <thead>
+                <tr>
+                  <th>Job</th>
+                  <th>Error</th>
+                  <th className="hidden sm:table-cell">Failed at</th>
+                  <th className="text-right">Action</th>
+                </tr>
+              </thead>
+              <tbody>
+                {failedJobs.map((job) => (
+                  <tr key={String(job.dlqId ?? job.mongoJobId)}>
+                    <td>
+                      <div className="font-medium">
+                        {typeLabel(job.originalType)}
+                      </div>
+                      <JobId id={job.mongoJobId} />
+                    </td>
+                    <td className="max-w-md text-failed">
+                      {job.error ?? "Unknown error"}
+                    </td>
+                    <td className="hidden whitespace-nowrap text-muted sm:table-cell">
+                      {formatTime(job.failedAt)}
+                    </td>
+                    <td>
+                      <div className="flex justify-end">
+                        <button
+                          type="button"
+                          onClick={() => void handleRetryFailed(String(job.dlqId))}
+                          className="btn btn-secondary btn-sm"
                         >
                           Retry
                         </button>
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          )}
-        </section>
-      </div>
+                      </div>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </section>
     </div>
   );
 }

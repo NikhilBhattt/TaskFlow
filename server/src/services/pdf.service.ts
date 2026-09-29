@@ -66,13 +66,18 @@ export const generatePdfReport = async (
       try {
         const uploadResult: UploadResult =
           await uploadPDFtoCloudinary(filePath);
-        fs.unlinkSync(filePath);
         resolve(uploadResult);
       } catch (error) {
         reject(error);
+      } finally {
+        // Always remove the temp file, including when the upload fails and the job is retried.
+        fs.rmSync(filePath, { force: true });
       }
     });
 
-    stream.on("error", reject);
+    stream.on("error", (error) => {
+      fs.rmSync(filePath, { force: true });
+      reject(error);
+    });
   });
 };

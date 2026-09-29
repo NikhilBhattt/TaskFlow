@@ -3,17 +3,19 @@ import jobsModel from "../models/jobs.model.js";
 import deadLetterQueue from "../queues/deadLetterQueue.js";
 import { processEmail } from "./processEmail.js";
 import { processPdf } from "./processPdf.js";
-import config from "../config/config.js";
+import { redisConnection } from "../config/redis.js";
 
 let jobWorker: Worker;
 
 const initializeJobWorker = () => {
   jobWorker = new Worker("jobs", async (job) => await handleJobWorker(job), {
-    connection: {
-      host: config.REDIS_HOST,
-      port: Number(config.REDIS_PORT),
-    },
+    connection: redisConnection,
     concurrency: 5,
+  });
+
+  // Without this listener a Redis outage would surface as an unhandled 'error' event.
+  jobWorker.on("error", (err) => {
+    console.error("Worker error:", err.message);
   });
 
   jobWorker.on("completed", async (job) => {
@@ -26,7 +28,7 @@ const initializeJobWorker = () => {
         completedAt: new Date(),
       },
     );
-    console.log(`Job ${job.id} completed after ${job.attemptsMade} retries`);
+    console.log(`Job ${job.id} completed (attempts used: ${job.attemptsMade + 1})`);
   });
 
   jobWorker.on("failed", async (job, err) => {
@@ -77,7 +79,11 @@ const handleJobWorker = async (job: Job) => {
       break;
 
     case "pdf":
-      await processPdf({ jobId: String(job.id), content: job.data.payload.content });
+      await processPdf({
+        jobId: String(job.id),
+        mongoJobId: job.data.mongoJobId,
+        content: job.data.payload.content,
+      });
       break;
 
     default:
@@ -85,9 +91,4 @@ const handleJobWorker = async (job: Job) => {
   }
 };
 
-const getJobWorker = () => {
-  if (!jobWorker) initializeJobWorker();
-  return jobWorker;
-};
-
-export { initializeJobWorker, getJobWorker };
+export { initializeJobWorker };

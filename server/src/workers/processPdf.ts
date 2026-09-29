@@ -1,20 +1,18 @@
 import jobsModel from "../models/jobs.model.js";
-import { jobQueue } from "../queues/jobQueue.js";
 import { generatePdfReport } from "../services/pdf.service.js";
 
-interface UploadResult {
-  url: string;
-  publicId: string;
+interface ProcessPdfInput {
+  jobId: string;
+  mongoJobId: string;
+  content: string;
 }
 
-export const processPdf = async (data: any) => {
-  const { url, publicId }: UploadResult = await generatePdfReport(data);
-
-  const job = await jobQueue.getJob(data.jobId);
+// Generates the PDF, uploads it to Cloudinary, and stores the resulting URL on the MongoDB job record.
+export const processPdf = async ({ jobId, mongoJobId, content }: ProcessPdfInput) => {
+  const { url, publicId } = await generatePdfReport({ jobId, content });
 
   await jobsModel.updateOne(
-    { _id: job?.data.mongoJobId },
+    { _id: mongoJobId },
     { pdfUrl: url, pdfPublicId: publicId },
   );
-  
 };
